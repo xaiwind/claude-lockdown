@@ -76,3 +76,17 @@ echo 'PASS: dual-stack multi-interface rules, rollback, injection rejection, gen
 ) > "$TMP/status"
 grep -q '未向 Claude/Anthropic' "$TMP/status"
 echo 'PASS: status is passive and sends no Claude requests'
+
+(
+  pfctl() {
+    case "$*" in
+      -sr) printf '%s\n' 'scrub-anchor "com.apple/*" all fragment reassemble' 'anchor "com.apple/*" all' 'anchor "com.claude.lockdown" all';;
+      '-a com.claude.lockdown -sr') [ "${BUSY:-0}" = 0 ] || echo 'block drop out quick on en0 inet from any to 160.79.104.0/21';;
+      *) return 1;;
+    esac
+  }
+  check_root_anchor
+  BUSY=1
+  if check_root_anchor; then echo 'FAIL: live legacy rules accepted'; exit 1; fi
+)
+echo 'PASS: default scrub anchor and empty legacy migration entry accepted, active legacy rejected'

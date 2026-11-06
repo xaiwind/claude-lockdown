@@ -50,8 +50,15 @@ check_root_anchor() {
     fail '当前 PF 未加载 com.apple/* 调用入口；为避免覆盖其他规则，不自动重载 /etc/pf.conf'; return 1;
   }
   # Last-match semantics: do not assume this child anchor overrides custom root rules.
-  if printf '%s\n' "$rules" | grep -Ev '^[[:space:]]*$|^anchor "com.apple/\*" all$' | grep -q .; then
+  if printf '%s\n' "$rules" | grep -Ev '^[[:space:]]*$|^anchor "com.apple/\*" all$|^scrub-anchor "com.apple/\*" all( fragment reassemble)?$|^anchor "com.claude.lockdown" all$' | grep -q .; then
     fail '检测到自定义主过滤规则；需人工审查规则顺序，不自动修改'; return 1
+  fi
+  # Migration leaves a harmless empty legacy call in the running root ruleset
+  # until reboot, avoiding a global PF reload that could affect other services.
+  if printf '%s\n' "$rules" | grep -q '^anchor "com.claude.lockdown" all$'; then
+    local legacy
+    legacy=$(pfctl -a com.claude.lockdown -sr) || return 1
+    [ -z "$legacy" ] || { fail '旧版 anchor 仍有规则，请先迁移'; return 1; }
   fi
 }
 install_rules() {
