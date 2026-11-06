@@ -13,6 +13,9 @@ ANCHOR_FILE="$STATE_DIR/rules"
 TOKEN_FILE="$STATE_DIR/pf-token"
 GENERATION_FILE="$STATE_DIR/generation"
 INSTALL_PATH="/usr/local/sbin/claude-lockdown.sh"
+HELPER="/usr/local/libexec/claude-lockdown/known_addresses.py"
+PROFILE_FILE="$STATE_DIR/sfm-profile"
+PROXY_PORT_FILE="$STATE_DIR/proxy-port"
 DAEMON_LABEL="com.claude.lockdown"
 DAEMON_PLIST="/Library/LaunchDaemons/$DAEMON_LABEL.plist"
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
@@ -31,7 +34,7 @@ lock() {
   done
   LOCKED=1
   local boot
-  boot=$(sysctl -n kern.boottime) || return 1
+  boot=$(sysctl -n kern.boottime) || { rmdir "$STATE_DIR/lock"; LOCKED=0; return 1; }
   if [ ! -f "$STATE_DIR/boot" ] || [ "$(cat "$STATE_DIR/boot")" != "$boot" ]; then
     rm -f "$TOKEN_FILE"
     printf '%s\n' "$boot" > "$STATE_DIR/boot"
@@ -42,7 +45,17 @@ phys_ifaces() {
   # Include interfaces without addresses: later DHCP must not bypass the rule.
   ifconfig -l | tr ' ' '\n' | awk '/^(en[0-9]+|eth[0-9]+|pdp_ip[0-9]+|bridge[0-9]+)$/ {printf "%s ", $0}'
 }
-load_cidrs() { if [ -s "$CIDR_FILE" ]; then cat "$CIDR_FILE"; else printf '%s\n' $DEFAULT_CIDRS; fi; }
+ensure_cidrs() {
+  if [ -e "$CIDR_FILE" ]; then
+    [ -s "$CIDR_FILE" ] || { fail '已有名单为空；拒绝覆盖，请先人工检查'; return 1; }
+    return 0
+  fi
+  local tmp
+  tmp=$(mktemp "$STATE_DIR/initial-cidrs.XXXXXX") || return 1
+  printf '%s\n' $DEFAULT_CIDRS > "$tmp" || { rm -f "$tmp"; return 1; }
+  mv "$tmp" "$CIDR_FILE"
+}
+load_cidrs() { cat "$CIDR_FILE"; }
 check_root_anchor() {
   local rules
   rules=$(pfctl -sr) || return 1
@@ -61,6 +74,26 @@ check_root_anchor() {
     [ -z "$legacy" ] || { fail '旧版 anchor 仍有规则，请先迁移'; return 1; }
   fi
 }
+verify_rules() {
+  # PF may normalize /32, IPv6 text, or combine networks. Compare semantics,
+  # including the interface, rather than merely checking for any block rule.
+  python3 - "$1" "$2" <<'PYCODE'
+import ipaddress, re, sys
+pattern = re.compile(r'^block drop out quick on (\S+) (inet6?) from any to (\S+)(?:\s|$)')
+def parse(path):
+    result = []
+    for line in open(path):
+        match = pattern.match(line.strip())
+        if match:
+            interface, family, target = match.groups()
+            result.append((interface, family, ipaddress.ip_network(target, strict=False)))
+    return result
+expected, actual = parse(sys.argv[1]), parse(sys.argv[2])
+if not expected or any(not any(i == j and f == g and n.version == m.version and n.subnet_of(m)
+                               for j, g, m in actual) for i, f, n in expected):
+    sys.exit(1)
+PYCODE
+}
 install_rules() {
   local ifs="$1" cidrs="$2" i c fam tmp
   [ -n "$ifs" ] || { fail '未识别到物理网卡'; return 1; }
@@ -78,7 +111,6 @@ install_rules() {
   [ -s "$tmp" ] || { rm -f "$tmp"; fail '空规则'; return 1; }
   if ! pfctl -n -a "$ANCHOR" -f "$tmp"; then rm -f "$tmp"; return 1; fi
   if ! pfctl -a "$ANCHOR" -f "$tmp"; then rm -f "$tmp"; return 1; fi
-  mv "$tmp" "$ANCHOR_FILE" || return 1
   if [ ! -s "$TOKEN_FILE" ]; then
     local output token
     output=$(pfctl -E 2>&1) || { printf '%s\n' "$output" >&2; return 1; }
@@ -86,8 +118,16 @@ install_rules() {
     [[ "$token" =~ ^[0-9]+$ ]] || { fail 'PF 未返回可追踪的引用 token，请检查 pfctl -s References'; return 1; }
     printf '%s\n' "$token" > "$TOKEN_FILE" || return 1
   fi
-  pfctl -si | grep -q 'Status: Enabled' || { fail 'PF 未启用'; return 1; }
-  pfctl -a "$ANCHOR" -sr | grep -q '^block' || { fail '内核中未发现阻断规则'; return 1; }
+  pfctl -si | grep -q 'Status: Enabled' || { rm -f "$tmp"; fail 'PF 未启用'; return 1; }
+  local readback
+  readback=$(mktemp "$STATE_DIR/readback.XXXXXX") || { rm -f "$tmp"; return 1; }
+  if ! pfctl -a "$ANCHOR" -sr > "$readback"; then rm -f "$tmp" "$readback"; return 1; fi
+  if ! verify_rules "$tmp" "$readback"; then
+    rm -f "$tmp" "$readback"
+    fail '内核规则未完整覆盖预期网卡和地址'; return 1
+  fi
+  rm -f "$readback"
+  mv "$tmp" "$ANCHOR_FILE" || return 1
 }
 apply_rules() {
   local previous had_rules=0
@@ -122,26 +162,77 @@ kill_target_states() {
     case "$c" in *:*) pfctl -k ::/0 -k "$c";; *) pfctl -k 0.0.0.0/0 -k "$c";; esac
   done
 }
-refresh_cidrs() {
-  command -v python3 >/dev/null || { fail 'refresh 需要 Python 3'; return 1; }
-  python3 - "$CIDR_FILE" <<'PY'
-import ipaddress, json, os, sys, tempfile, urllib.request
-req=urllib.request.Request('https://rdap.arin.net/registry/entity/AP-2440',headers={'User-Agent':'claude-lockdown/2.0'})
-with urllib.request.urlopen(req,timeout=25) as r: d=json.load(r)
-if d.get('handle') != 'AP-2440': raise ValueError('Unexpected ARIN entity')
-cidrs=[]
-for n in d.get('networks',[]):
-    start,end=map(ipaddress.ip_address,(n['startAddress'],n['endAddress']))
-    cidrs.extend(ipaddress.summarize_address_range(start,end))
-if not cidrs: raise ValueError('ARIN returned no networks; old list preserved')
-fd,tmp=tempfile.mkstemp(dir=os.path.dirname(sys.argv[1]))
-try:
-    with os.fdopen(fd,'w') as f: f.write('\n'.join(sorted(set(map(str,cidrs))))+'\n')
-    os.replace(tmp,sys.argv[1])
-finally:
-    if os.path.exists(tmp): os.unlink(tmp)
-PY
+kill_added_states() {
+  local added target failed=0
+  added=$(mktemp "$STATE_DIR/added.XXXXXX") || return 1
+  if ! python3 - "$1" "$2" > "$added" <<'PYADDED'
+import ipaddress, sys
+
+def load(path):
+    with open(path) as f:
+        return [ipaddress.ip_network(line.strip()) for line in f if line.strip()]
+old, new = load(sys.argv[1]), load(sys.argv[2])
+for net in new:
+    if not any(net.version == previous.version and net.subnet_of(previous) for previous in old):
+        print(net)
+PYADDED
+  then rm -f "$added"; return 1; fi
+  while IFS= read -r target; do
+    [ -n "$target" ] || continue
+    case "$target" in
+      *:*) pfctl -k ::/0 -k "$target" || failed=1;;
+      *) pfctl -k 0.0.0.0/0 -k "$target" || failed=1;;
+    esac
+  done < "$added"
+  rm -f "$added"
+  [ "$failed" -eq 0 ]
 }
+
+collect_known() {
+  [ -r "$HELPER" ] && [ -s "$PROFILE_FILE" ] && [ -s "$PROXY_PORT_FILE" ] || {
+    fail '未配置 SFM 文件或 DNS 更新组件；旧规则保持不变'; return 1;
+  }
+  local profile port
+  profile=$(cat "$PROFILE_FILE"); port=$(cat "$PROXY_PORT_FILE")
+  python3 "$HELPER" --current "$CIDR_FILE" --output "$1" --sfm-profile "$profile" --proxy-port "$port"
+}
+
+refresh_known() {
+  local candidate backup
+  [ -s "$CIDR_FILE" ] || { fail '旧名单不存在，拒绝覆盖'; return 1; }
+  if [ -s "$STATE_DIR/pending-previous" ]; then
+    if ! kill_added_states "$STATE_DIR/pending-previous" "$CIDR_FILE"; then
+      echo '上次新增地址的旧连接仍未能清理，请检查日志。' >&2; return 1
+    fi
+    rm -f "$STATE_DIR/pending-previous"
+  fi
+  candidate=$(mktemp "$STATE_DIR/candidate.XXXXXX") || return 1
+  backup=$(mktemp "$STATE_DIR/cidrs-backup.XXXXXX") || { rm -f "$candidate"; return 1; }
+  if ! cp "$CIDR_FILE" "$backup"; then rm -f "$candidate" "$backup"; return 1; fi
+  if ! collect_known "$candidate"; then
+    rm -f "$candidate" "$backup"
+    echo 'DNS 更新失败，保留旧名单。' >&2; return 1
+  fi
+  if cmp -s "$candidate" "$CIDR_FILE"; then
+    rm -f "$candidate" "$backup"
+    date -u '+%Y-%m-%dT%H:%M:%SZ' > "$STATE_DIR/last-dns-success"
+    echo 'DNS 已检查，无新增地址。'; return 0
+  fi
+  if ! mv "$candidate" "$CIDR_FILE"; then rm -f "$candidate" "$backup"; return 1; fi
+  if ! apply_rules; then
+    mv "$backup" "$CIDR_FILE"
+    if ! apply_rules; then echo '恢复旧规则失败，请立即人工检查 PF。' >&2; fi
+    echo '新规则未通过核验，已恢复旧名单。' >&2; return 1
+  fi
+  if ! kill_added_states "$backup" "$CIDR_FILE"; then
+    mv "$backup" "$STATE_DIR/pending-previous"
+    echo '新规则已加载，但部分旧连接未能清理；下次更新会重试。' >&2; return 1
+  fi
+  rm -f "$backup"
+  date -u '+%Y-%m-%dT%H:%M:%SZ' > "$STATE_DIR/last-dns-success"
+  echo '已合并新 IP、验证内核规则并清理对应旧连接。'
+}
+
 trial_cleanup() {
   lock || return 1
   if [ -f "$GENERATION_FILE" ] && [ "$(cat "$GENERATION_FILE")" = "$TRIAL_ID" ]; then
@@ -161,12 +252,16 @@ case "${1:-status}" in
     echo "当前识别网卡: $(phys_ifaces)"
     echo '实际 PF 状态与内核规则（文件存在不代表生效）:'
     pfctl -si; pfctl -a "$ANCHOR" -vvsr
+    if [ -f "$STATE_DIR/last-dns-success" ]; then
+      echo "最近 DNS 查询（UTC，完整性请看日志）: $(cat "$STATE_DIR/last-dns-success")"
+    else echo '尚无成功 DNS 检查记录；请查看服务日志。'; fi
     echo '只读检查完成；未向 Claude/Anthropic 发送任何请求。'
     ;;
   on)
     need_root
     [ "$#" -eq 1 ] || { [ "$#" -eq 2 ] && [ "$2" = --keep ]; } || { fail '用法: on [--keep]'; exit 1; }
     lock; trap unlock EXIT
+    ensure_cidrs
     [ ! -f /etc/pf.conf.bak.claude-lockdown ] || { fail '检测到旧版配置备份；请先按 README 迁移，不能叠加安装'; exit 1; }
     if [ "${2:-}" != --keep ]; then
       if [ -f "$ANCHOR_FILE" ] || launchctl print "system/$DAEMON_LABEL" >/dev/null 2>&1; then
@@ -197,32 +292,56 @@ case "${1:-status}" in
     remove_rules
     rm -f "$DAEMON_PLIST"
     if [ "$1" = uninstall ]; then
-      rm -f "$INSTALL_PATH" "$CIDR_FILE"
+      rm -f "$INSTALL_PATH" "$CIDR_FILE" "$PROFILE_FILE" "$PROXY_PORT_FILE" "$STATE_DIR/last-dns-success" "$STATE_DIR/pending-previous" "$HELPER"
+      rmdir /usr/local/libexec/claude-lockdown 2>/dev/null || true
       echo '已先撤销规则，再删除开机任务、安装脚本及网段缓存。'
     else echo '已撤销规则并移除自动启用任务；需要自动启用时重新 install。'; fi
     ;;
   refresh)
     need_root; lock; trap unlock EXIT
-    old_cidrs=$(mktemp "$STATE_DIR/old-cidrs.XXXXXX")
-    load_cidrs > "$old_cidrs"
-    if ! refresh_cidrs; then rm -f "$old_cidrs"; exit 1; fi
-    if [ -f "$ANCHOR_FILE" ] && ! apply_rules; then
-      mv "$old_cidrs" "$CIDR_FILE"; exit 1
-    fi
-    rm -f "$old_cidrs"
-    if [ -f "$ANCHOR_FILE" ]; then kill_target_states; fi
-    echo '已更新网段缓存；不代表完整域名覆盖。'
+    refresh_known
     ;;
   reconcile)
     need_root; lock; trap unlock EXIT
-    # Reapply for new interfaces or an externally reloaded PF ruleset.
+    # Keep cached rules active even if SFM/DNS is unavailable at boot.
+    ensure_cidrs
     apply_rules
+    if [ -s "$PROFILE_FILE" ] && [ -r "$HELPER" ]; then
+      refresh_known || echo '本次未更新 DNS；既有规则仍保留。' >&2
+    fi
     ;;
   install)
     need_root
-    # Validate/apply before registering automation. No shell background processes.
+    # Require explicit profile: do not guess a server and risk blocking the VPN.
+    [ "$#" -eq 5 ] && [ "$2" = --sfm-profile ] && [ "$4" = --proxy-port ] || {
+      fail '用法: install --sfm-profile 配置文件路径 --proxy-port 本地代理端口'; exit 1;
+    }
+    PROFILE="$3"; PORT="$5"
+    [[ "$PORT" =~ ^[0-9]+$ ]] && [ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ] || { fail '代理端口无效'; exit 1; }
+    [[ "$PROFILE" = /* ]] && [ -f "$PROFILE" ] || { fail 'SFM 配置路径必须是存在的绝对路径'; exit 1; }
+    SOURCE_HELPER="$(dirname "$SELF")/known_addresses.py"
+    [ -r "$SOURCE_HELPER" ] || { fail '找不到同目录的 known_addresses.py'; exit 1; }
+    python3 - "$SOURCE_HELPER" "$PROFILE" "$PORT" "$CIDR_FILE" "$DEFAULT_CIDRS" <<'PYVALIDATE'
+import importlib.util, json, pathlib, sys
+s=importlib.util.spec_from_file_location('known_addresses',sys.argv[1]); m=importlib.util.module_from_spec(s); s.loader.exec_module(m)
+with open(sys.argv[2]) as f: profile=json.load(f)
+servers=m.proxy_servers(profile)
+cidrs=pathlib.Path(sys.argv[4])
+old=m.parse_networks(cidrs.read_text() if cidrs.exists() else '\n'.join(sys.argv[5].split()))
+if any(ip.version == net.version and ip in net for ip in servers for net in old):
+    raise SystemExit('现有阻断网段包含 SFM 服务器 IP，停止安装以免中断代理。')
+if not any(i.get('type') in ('mixed','http') and i.get('listen') == '127.0.0.1' and i.get('listen_port') == int(sys.argv[3]) for i in profile.get('inbounds',[])):
+    raise SystemExit('SFM 配置未找到指定的本地 HTTP/mixed 端口')
+PYVALIDATE
     bash "$SELF" on --keep
+    # Stop the prior periodic job before acquiring the update lock.
+    stop_daemon
     lock; trap unlock EXIT
+    mkdir -p /usr/local/libexec/claude-lockdown
+    cp "$SOURCE_HELPER" "$HELPER"
+    chmod 644 "$HELPER"; chown root:wheel "$HELPER"
+    printf '%s\n' "$PROFILE" > "$PROFILE_FILE"
+    printf '%s\n' "$PORT" > "$PROXY_PORT_FILE"
     mkdir -p /usr/local/sbin
     if [ "$SELF" != "$INSTALL_PATH" ]; then cp "$SELF" "$INSTALL_PATH"; fi
     chmod 755 "$INSTALL_PATH"; chown root:wheel "$INSTALL_PATH"
@@ -240,10 +359,9 @@ case "${1:-status}" in
 PLIST
     chmod 644 "$DAEMON_PLIST"; chown root:wheel "$DAEMON_PLIST"
     plutil -lint "$DAEMON_PLIST"
-    stop_daemon
     unlock
     launchctl bootstrap system "$DAEMON_PLIST"
-    echo '已注册开机及每 86400 秒（24 小时）规则刷新。开机/新网卡存在未覆盖窗口，不是无缝 kill switch。'
+    echo '已注册开机及每 24 小时更新。请用 status 和服务日志检查结果。'
     ;;
-  *) echo '用法: sudo bash claude-lockdown.sh {status|on [--keep]|off|refresh|install|uninstall}'; exit 2;;
+  *) echo '用法: sudo bash claude-lockdown.sh {status|on [--keep]|off|refresh|install --sfm-profile 路径 --proxy-port 端口|uninstall}'; exit 2;;
 esac

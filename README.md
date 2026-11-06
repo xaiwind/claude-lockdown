@@ -1,69 +1,88 @@
-# claude-lockdown（修订版）
+# claude-lockdown
 
-macOS 上针对指定 IPv4/IPv6 网段的物理网卡出站阻断工具，可配合 TUN VPN 使用。它不是域名级或进程级 kill switch，不能保证所有 Claude/Anthropic 流量都被覆盖，也不代表账号免封或匿名保证。
+macOS 上的出站网段阻断工具，配合 **sing-box for macOS（SFM）** 使用：保留已知 Anthropic 网段，并通过 SFM 查询一组已知 Claude 域名的 IP，阻止这些地址从物理网卡直连。默认每天检查一次。
 
-已知域名与当前 IP 规则的差异见 [域名与覆盖边界](KNOWN-DOMAINS.md)。
+> **使用前请先读：** 这是一种按 IP 地址阻断的方法。它能降低已知地址意外直连的风险，但不能识别全部动态子域名、未收录地址或 DNS 返回之外的 IP，也不能保证账号不受限制。部分地址由第三方共用，阻断可能影响其他网站。若你的 SFM 配置把 Claude 流量分到直连，规则可能阻断 Claude；请先确认 SFM 自身的分流设置。
+>
+> 此版本只经过模拟 PF 测试和通过 SFM 的 DNS 查询测试，**尚未在真实 PF/VPN 断开场景验证**。不要用真实 Claude 账号做断网测试。
 
-## 使用
+## 它如何工作
 
-先查看并理解脚本，再运行。`status` 仅查看本地规则，不发起任何 Claude/Anthropic 网络请求：
+- 开机及每 24 小时：先加载已保存的阻断名单，再尝试更新地址。
+- 更新时通过本机 SFM HTTP/mixed 代理向 Cloudflare DNS 查询已知域名的 A/AAAA 记录；不向 Claude 网站发送请求，不读取账号信息。
+- 将新地址追加到名单；DNS 或代理不可用时，保留旧名单。对共享云地址只添加查询得到的单个 IP，不封锁整个第三方网段。
+- 对每个网卡核对实际 PF 规则，加载失败时恢复旧名单与规则；新增加的地址会尝试清理对应旧连接状态。
+- 检查所配置的 SFM 服务器 IP，防止新增规则阻断代理服务器。代理服务器是域名而不是固定 IP 时，拒绝自动更新。
+
+已知域名范围、来源和限制见 [域名与覆盖边界](KNOWN-DOMAINS.md)。Chrome、Claude Code 都受相同的 IP 规则约束；本项目不按应用或域名识别流量。
+
+## 准备
+
+需要 macOS、已安装的 SFM、Python 3、Git，以及管理员权限。准备好：
+
+1. **SFM 当前配置文件的绝对路径**，例如 `.../configs/config_5.json`。文件中可能包含代理凭据，请勿上传或发送给他人。
+2. SFM 配置中的本地 **HTTP 或 mixed 代理端口**，例如 `2345`；配置须监听 `127.0.0.1`。实际端口以你的配置为准。
+3. 保持 SFM 连接，确认 Claude 相关请求在 SFM 的规则中走代理。
+
+项目不修改 SFM 配置，也不替你购买服务器。更换 SFM 配置文件或本地代理端口后，需要重新安装以更新路径和端口。
+
+## 安装或升级
+
+下载本仓库到本机，终端进入目录。将下面两处替换成你自己的配置路径和端口：
+
+```bash
+git clone https://github.com/xaiwind/claude-lockdown.git
+cd claude-lockdown
+sudo bash claude-lockdown.sh install --sfm-profile "/你的/SFM配置文件.json" --proxy-port 2345
+```
+
+安装会保留现有名单，启动时和每 24 小时刷新；立即运行一次可手动更新：
+
+```bash
+sudo bash claude-lockdown.sh refresh
+```
+
+开机时如果 SFM 尚未连接，查询可能失败；旧规则依然保留。SFM 连接后可手动运行 `refresh`，否则等待下一次定时检查。不要在公开场所粘贴配置文件内容或代理凭据。
+
+若之前使用过修改 `/etc/pf.conf` 的**最早版本**，先检查和迁移旧版；不要直接覆盖历史 PF 备份。若已迁移到 `com.apple/claude-lockdown` 版本，可按以上步骤升级。安装前会检查旧版入口、代理配置和当前规则；发现不兼容时停止，不清空全局防火墙。
+
+## 怎么确认是否生效
+
+保持 VPN 开启，运行只读检查：
 
 ```bash
 sudo bash claude-lockdown.sh status
-sudo bash claude-lockdown.sh on          # 前台试用 60 秒；Ctrl-C 撤销
-sudo bash claude-lockdown.sh on --keep   # 保持至 off 或重启
-sudo bash claude-lockdown.sh refresh     # Python 3；ARIN 更新网段缓存
-sudo bash claude-lockdown.sh install     # 安装启动任务，每 24 小时刷新规则
-sudo bash claude-lockdown.sh off         # 撤销规则，同时取消自动启用任务
-sudo bash claude-lockdown.sh uninstall   # 先撤销规则，再移除安装文件
 ```
 
-试用期间可在另一终端 `on --keep` 接管；旧试用不会再撤销新一代规则。已有持久规则或自动任务时拒绝直接进入临时试用，避免覆盖原状态。强制杀死进程或掉电不能保证试用清理执行，需检查状态并手动 off。操作锁若因强杀残留，确认没有脚本进程后才可删除 `/var/db/claude-lockdown/lock`。
+查看三项：
 
-`off` 释放本工具取得的 PF 引用，不全局禁用 PF；其他程序的 PF 引用不受影响。`refresh` 查询失败返回非零并保留原名单，名单更新不证明完整覆盖。内置名单来自用户提供的旧脚本，本次未核验其当前所有权和完整性。
+1. PF 状态显示 `Status: Enabled`。
+2. `com.apple/claude-lockdown` 规则中有当前物理网卡的 `block drop out quick` 和目标地址。
+3. 查看最近 DNS 查询时间和日志；如提示查询失败，说明仍在使用旧名单。
 
-## 兼容性与前提
+查看日志：
 
-仅适用于 macOS。需要系统自带 bash、pfctl、curl、launchctl 等；刷新 ARIN 名单额外需要 Python 3。脚本复用内核中已有的 `com.apple/*` PF anchor 入口，使用独立子 anchor `com.apple/claude-lockdown`，不写入或重载 `/etc/pf.conf`。
+```bash
+sudo tail -n 80 /var/log/claude-lockdown.log
+```
 
-如果系统尚未加载该入口，或主过滤规则存在自定义内容，脚本拒绝自动安装。需要先审查实际 PF 配置，不应为了安装直接覆盖或重载未知规则。其他 `com.apple/*` 子 anchor 的规则也可能影响最终判定，仍需要真实网络测试。
+`Packets: 0` 不代表规则失效；`No ALTQ support` 通常只是系统提示。规则存在不等于完整防泄漏。**不要关闭 VPN 后在真实 Claude 账号上试错。** 要验证断线行为，应关闭真实 Claude 会话，在隔离环境中用自有测试服务、测试地址、抓包和 PF 计数交叉验证。
 
-物理接口匹配 `enN`、`ethN`、`pdp_ipN`、`bridgeN`，包括暂时没有 IP 的接口。其他接口命名不自动覆盖。TUN 隧道中的包和 VPN 外层包如何经过 PF，必须按实际 VPN 实测，不承诺所有客户端兼容。
+## 停止和卸载
 
-## 与旧版的区别
+```bash
+sudo bash claude-lockdown.sh off        # 停止自动更新并清除本工具规则
+sudo bash claude-lockdown.sh uninstall  # 停止规则并移除本工具安装文件
+```
 
-- 只更新、清空自己的 anchor，不恢复旧版整份 pf.conf 备份。
-- 校验 PF 语法、加载结果、启用状态和内核规则；不吞掉加载错误。
-- 候选规则加载失败时尝试恢复本工具旧规则；回滚失败会明确报错。
-- PF 引用 token 独立保存，重启后丢弃过期 token。
-- 试用保持前台，使用 generation 标识防止旧计时器误撤销新设置。
-- `status` 改为被动检查：只读取 PF 状态与规则，不再主动访问 Claude，也不尝试绑定物理网卡访问 Claude。
-- 手动启用/更新名单时仅清理目标网段的既有 PF 状态，不清空所有连接；目标范围内的隧道连接可能需要重连。
-- off 先停止自动任务，uninstall 先撤销规则再删除脚本。
+两者会移除自动任务。需要重新启用自动更新时，再运行上面的安装命令。它们不恢复整份历史 `/etc/pf.conf`，不主动禁用其他程序使用的 PF 引用。此前的迁移备份位于 `/var/db/claude-lockdown-migration/`，不要直接覆盖现有系统配置。
 
-## 旧版迁移
-
-如果以前运行过旧版，先检查 `/etc/pf.conf`、`/etc/pf.conf.bak.claude-lockdown` 和原 `com.claude.lockdown` anchor。新版检测到旧备份会拒绝叠加启用。
-
-不要直接用旧备份覆盖现有 pf.conf：其中可能已有其他软件后来添加的设置。需比较差异，仅移除旧脚本添加的 anchor/load anchor 项，审查并验证候选配置后，由操作者决定如何应用。停止旧 `com.claude.lockdown` LaunchDaemon，清理旧 anchor 及旧脚本文件，然后保留旧备份作为归档并移走原检测路径。新版 off 不负责自动迁移旧版全局配置。
-
-## 验收与限制
-
-自动测试只模拟 PF/网络命令，不改本机防火墙：
+## 开发验证
 
 ```bash
 bash -n claude-lockdown.sh
 bash test.sh
+python3 -m unittest test_known.py test_integration.py
 ```
 
-交付时已通过以上检查，尚未在真实 PF、VPN 及重启环境验证。
-
-实际验收不使用真实 Claude 账号，也不通过关闭 VPN 后发送 Claude 请求来试错。先退出已登录的 Claude 客户端、CLI 和相关浏览器页面，在独立测试环境中用自有测试服务器及临时测试网段验证 VPN 开启/关闭、IPv4/IPv6、已有连接、网卡切换和重启。结合抓包、测试服务器日志和 PF 计数交叉确认。测试通过只能证明该场景中的规则机制，不能证明 Anthropic 网段名单完整。
-
-新插入网卡、开机到任务启动之间，以及外部程序刷新 PF 后，都可能有覆盖窗口。24 小时刷新不是实时保证，期间新网卡或被外部重载的规则可能长时间不受保护。未在名单内的 CDN/IP、其他代理或网络扩展、非匹配接口不在保证范围内。需要严格“隧道一停所有指定应用立即断网”时，应另行设计应用级或更完整的网络策略，不能把本脚本当作替代品。
-
-## 选择哪种方案
-
-本仓库当前实现的是 macOS 网段阻断方案，适合继续使用现有桌面客户端和浏览器、希望减少指定网段直连风险的用户。不改变原有登录或文件使用方式，但无法承诺零遗漏。
-
-严格隔离属于另一套部署方式：将程序放入专用环境，仅允许连接指定代理出口，并确保代理自身不回退直连。它需要单独处理登录、文件共享和代理配置，不自动保护宿主机上的 Claude 桌面版或浏览器。本仓库尚未实现或验证这一方案，不要将现有脚本误认为严格隔离。
+测试使用模拟 PF，不更改电脑防火墙。真实环境仍须单独验证。系统重启到任务启动前、新网卡出现、其他程序重载 PF，以及 DNS 更新间隔内，均可能出现保护空档。

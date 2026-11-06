@@ -90,3 +90,84 @@ echo 'PASS: status is passive and sends no Claude requests'
   if check_root_anchor; then echo 'FAIL: live legacy rules accepted'; exit 1; fi
 )
 echo 'PASS: default scrub anchor and empty legacy migration entry accepted, active legacy rejected'
+# A successful pfctl exit with stale kernel rules must not be reported as success.
+(
+  STATE_DIR="$TMP/verify-state"; mkdir -p "$STATE_DIR"
+  ANCHOR_FILE="$STATE_DIR/rules"; TOKEN_FILE="$STATE_DIR/token"; CIDR_FILE="$STATE_DIR/cidrs"
+  printf '12345\n' > "$TOKEN_FILE"
+  printf '160.79.104.0/21\n' > "$CIDR_FILE"
+  printf 'block drop out quick on en0 inet from any to 160.79.104.0/21\n' > "$ANCHOR_FILE"
+  phys_ifaces() { echo en0; }
+  pfctl() {
+    case "$*" in
+      '-sr') echo 'anchor "com.apple/*" all';;
+      '-si') echo 'Status: Enabled';;
+      "-a $ANCHOR -sr") echo 'block drop out quick on en0 inet from any to 160.79.104.0/21';;
+      '-n '*|"-a $ANCHOR -f "*) return 0;;
+      *) return 1;;
+    esac
+  }
+  printf '160.79.104.0/21\n34.120.108.227/32\n' > "$CIDR_FILE"
+  if apply_rules; then echo 'FAIL: stale PF output incorrectly accepted' >&2; exit 1; fi
+)
+echo 'PASS: stale kernel rules rejected'
+# A failed DNS update or failed rule load cannot discard the existing block list.
+(
+  STATE_DIR="$TMP/refresh-state"; mkdir -p "$STATE_DIR"
+  pfctl() { return 0; }
+  CIDR_FILE="$STATE_DIR/cidrs"
+  printf '160.79.104.0/21\n' > "$CIDR_FILE"
+  collect_known() { return 1; }
+  apply_rules() { return 0; }
+  if refresh_known; then echo 'FAIL: DNS failure reported success' >&2; exit 1; fi
+  [ "$(cat "$CIDR_FILE")" = '160.79.104.0/21' ]
+  collect_known() { printf '160.79.104.0/21\n34.120.108.227/32\n' > "$1"; }
+  apply_rules() { return 1; }
+  if refresh_known; then echo 'FAIL: PF failure reported success' >&2; exit 1; fi
+  [ "$(cat "$CIDR_FILE")" = '160.79.104.0/21' ]
+  collect_known() { printf '160.79.104.0/21\n34.120.108.227/32\n' > "$1"; }
+  apply_rules() { return 0; }
+  refresh_known
+  grep -q '^34.120.108.227/32$' "$CIDR_FILE"
+  grep -q '^160.79.104.0/21$' "$CIDR_FILE"
+)
+echo 'PASS: daily refresh keeps previous list on failures and adds only verified addresses'
+# Only states matching newly added destinations are cleared.
+(
+  STATE_DIR="$TMP/kill-state"; mkdir -p "$STATE_DIR"
+  printf '160.79.104.0/21\n' > "$STATE_DIR/old"
+  printf '160.79.104.0/21\n34.120.108.227/32\n2606:4700::1/128\n' > "$STATE_DIR/new"
+  pfctl() { printf '%s\n' "$*" >> "$STATE_DIR/calls"; }
+  kill_added_states "$STATE_DIR/old" "$STATE_DIR/new"
+  grep -q -- '-k 0.0.0.0/0 -k 34.120.108.227/32' "$STATE_DIR/calls"
+  grep -q -- '-k ::/0 -k 2606:4700::1/128' "$STATE_DIR/calls"
+  if grep -q '160.79.104.0/21' "$STATE_DIR/calls"; then echo 'FAIL: old states were cleared' >&2; exit 1; fi
+)
+echo 'PASS: reset only newly blocked destination states'
+# Fresh installs must persist the baseline before their first daily update.
+(
+  STATE_DIR="$TMP/fresh-state"; mkdir -p "$STATE_DIR"; CIDR_FILE="$STATE_DIR/cidrs"
+  ensure_cidrs
+  [ "$(wc -l < "$CIDR_FILE" | tr -d ' ')" = 4 ]
+  printf '160.79.104.0/21\n34.120.108.227/32\n' > "$CIDR_FILE"
+  ensure_cidrs
+  grep -q '^34.120.108.227/32$' "$CIDR_FILE"
+  : > "$CIDR_FILE"
+  if ensure_cidrs; then echo 'FAIL: empty existing CIDR list accepted' >&2; exit 1; fi
+)
+echo 'PASS: baseline persists and existing list is never replaced'
+# A failed connection-state cleanup stays visible and is retried next time.
+(
+  STATE_DIR="$TMP/pending-state"; mkdir -p "$STATE_DIR"; CIDR_FILE="$STATE_DIR/cidrs"
+  printf '160.79.104.0/21\n' > "$CIDR_FILE"
+  collect_known() { printf '160.79.104.0/21\n34.120.108.227/32\n' > "$1"; }
+  apply_rules() { return 0; }
+  attempts=0
+  kill_added_states() { attempts=$((attempts+1)); [ "$attempts" -gt 1 ]; }
+  if refresh_known; then echo 'FAIL: cleanup failure hidden' >&2; exit 1; fi
+  [ -s "$STATE_DIR/pending-previous" ]
+  refresh_known
+  [ ! -e "$STATE_DIR/pending-previous" ]
+  [ "$attempts" = 2 ]
+)
+echo 'PASS: failed state cleanup is retained and retried'
