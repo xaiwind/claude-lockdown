@@ -2,6 +2,8 @@
 
 macOS 上针对指定 IPv4/IPv6 网段的物理网卡出站阻断工具，可配合 TUN VPN 使用。它不是域名级或进程级 kill switch，不能保证所有 Claude/Anthropic 流量都被覆盖，也不代表账号免封或匿名保证。
 
+已知域名与当前 IP 规则的差异见 [域名与覆盖边界](KNOWN-DOMAINS.md)。
+
 ## 使用
 
 先查看并理解脚本，再运行。`status` 仅查看本地规则，不发起任何 Claude/Anthropic 网络请求：
