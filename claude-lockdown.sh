@@ -16,6 +16,7 @@ INSTALL_PATH="/usr/local/sbin/claude-lockdown.sh"
 HELPER="/usr/local/libexec/claude-lockdown/known_addresses.py"
 SERVER_FILE="$STATE_DIR/sfm-server-ips.json"
 PROXY_PORT_FILE="$STATE_DIR/proxy-port"
+HISTORY_FILE="$STATE_DIR/known-ip-history.json"
 DAEMON_LABEL="com.claude.lockdown"
 DAEMON_PLIST="/Library/LaunchDaemons/$DAEMON_LABEL.plist"
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
@@ -94,20 +95,38 @@ if not expected or any(not any(i == j and f == g and n.version == m.version and 
     sys.exit(1)
 PYCODE
 }
-install_rules() {
-  local ifs="$1" cidrs="$2" i c fam tmp
+build_rules() {
+  local ifs="$1" cidrs="$2" i c fam
   [ -n "$ifs" ] || { fail '未识别到物理网卡'; return 1; }
-  check_root_anchor || return 1
-  tmp=$(mktemp "$STATE_DIR/rules.XXXXXX") || return 1
   for i in $ifs; do
-    [[ "$i" =~ ^(en|eth|pdp_ip|bridge)[0-9]+$ ]] || { rm -f "$tmp"; fail '非法网卡名'; return 1; }
+    [[ "$i" =~ ^(en|eth|pdp_ip|bridge)[0-9]+$ ]] || { fail '非法网卡名'; return 1; }
     for c in $cidrs; do
-      # Reject PF syntax injection; pfctl -n performs the full network validation.
-      [[ "$c" =~ ^[0-9a-fA-F:.]+/[0-9]+$ ]] || { rm -f "$tmp"; fail '非法 CIDR'; return 1; }
+      [[ "$c" =~ ^[0-9a-fA-F:.]+/[0-9]+$ ]] || { fail '非法 CIDR'; return 1; }
       case "$c" in *:*) fam=inet6;; *) fam=inet;; esac
-      printf 'block drop out quick on %s %s from any to %s\n' "$i" "$fam" "$c" >> "$tmp"
+      printf 'block drop out quick on %s %s from any to %s\n' "$i" "$fam" "$c"
     done
   done
+}
+
+current_rules_match() {
+  local desired actual ifs cidrs rc=0
+  ifs=$(phys_ifaces) || return 1
+  cidrs=$(load_cidrs) || return 1
+  desired=$(mktemp "$STATE_DIR/desired.XXXXXX") || return 1
+  actual=$(mktemp "$STATE_DIR/actual.XXXXXX") || { rm -f "$desired"; return 1; }
+  check_root_anchor && build_rules "$ifs" "$cidrs" > "$desired" &&
+    pfctl -si | grep -q 'Status: Enabled' &&
+    pfctl -a "$ANCHOR" -sr > "$actual" &&
+    verify_rules "$desired" "$actual" && verify_rules "$actual" "$desired" || rc=1
+  rm -f "$desired" "$actual"
+  return "$rc"
+}
+
+install_rules() {
+  local ifs="$1" cidrs="$2" tmp
+  check_root_anchor || return 1
+  tmp=$(mktemp "$STATE_DIR/rules.XXXXXX") || return 1
+  if ! build_rules "$ifs" "$cidrs" > "$tmp"; then rm -f "$tmp"; return 1; fi
   [ -s "$tmp" ] || { rm -f "$tmp"; fail '空规则'; return 1; }
   if ! pfctl -o none -n -a "$ANCHOR" -f "$tmp"; then rm -f "$tmp"; return 1; fi
   if ! pfctl -o none -a "$ANCHOR" -f "$tmp"; then rm -f "$tmp"; return 1; fi
@@ -194,11 +213,11 @@ collect_known() {
   }
   local port
   port=$(cat "$PROXY_PORT_FILE")
-  python3 "$HELPER" --current "$CIDR_FILE" --output "$1" --server-list "$SERVER_FILE" --proxy-port "$port"
+  python3 "$HELPER" --current "$CIDR_FILE" --output "$1" --history "$HISTORY_FILE" --history-output "$2" --server-list "$SERVER_FILE" --proxy-port "$port"
 }
 
 refresh_known() {
-  local candidate backup
+  local candidate history_candidate backup
   [ -s "$CIDR_FILE" ] || { fail '旧名单不存在，拒绝覆盖'; return 1; }
   if [ -s "$STATE_DIR/pending-previous" ]; then
     if ! kill_added_states "$STATE_DIR/pending-previous" "$CIDR_FILE"; then
@@ -207,22 +226,31 @@ refresh_known() {
     rm -f "$STATE_DIR/pending-previous"
   fi
   candidate=$(mktemp "$STATE_DIR/candidate.XXXXXX") || return 1
-  backup=$(mktemp "$STATE_DIR/cidrs-backup.XXXXXX") || { rm -f "$candidate"; return 1; }
-  if ! cp "$CIDR_FILE" "$backup"; then rm -f "$candidate" "$backup"; return 1; fi
-  if ! collect_known "$candidate"; then
-    rm -f "$candidate" "$backup"
+  history_candidate=$(mktemp "$STATE_DIR/history-candidate.XXXXXX") || { rm -f "$candidate"; return 1; }
+  backup=$(mktemp "$STATE_DIR/cidrs-backup.XXXXXX") || { rm -f "$candidate" "$history_candidate"; return 1; }
+  if ! cp "$CIDR_FILE" "$backup"; then rm -f "$candidate" "$history_candidate" "$backup"; return 1; fi
+  if ! collect_known "$candidate" "$history_candidate" || [ ! -s "$history_candidate" ]; then
+    rm -f "$candidate" "$history_candidate" "$backup"
     echo 'DNS 更新失败，保留旧名单。' >&2; return 1
   fi
   if cmp -s "$candidate" "$CIDR_FILE"; then
+    if ! mv "$history_candidate" "$HISTORY_FILE"; then rm -f "$candidate" "$history_candidate" "$backup"; return 1; fi
     rm -f "$candidate" "$backup"
     date -u '+%Y-%m-%dT%H:%M:%SZ' > "$STATE_DIR/last-dns-success"
     echo 'DNS 已检查，无新增地址。'; return 0
   fi
-  if ! mv "$candidate" "$CIDR_FILE"; then rm -f "$candidate" "$backup"; return 1; fi
+  if ! mv "$candidate" "$CIDR_FILE"; then rm -f "$candidate" "$history_candidate" "$backup"; return 1; fi
   if ! apply_rules; then
+    rm -f "$history_candidate"
     mv "$backup" "$CIDR_FILE"
     if ! apply_rules; then echo '恢复旧规则失败，请立即人工检查 PF。' >&2; fi
     echo '新规则未通过核验，已恢复旧名单。' >&2; return 1
+  fi
+  if ! mv "$history_candidate" "$HISTORY_FILE"; then
+    mv "$backup" "$CIDR_FILE"
+    if ! apply_rules; then echo '恢复旧规则失败，请立即人工检查 PF。' >&2; fi
+    rm -f "$history_candidate"
+    echo '历史记录无法保存；已恢复旧名单。' >&2; return 1
   fi
   if ! kill_added_states "$backup" "$CIDR_FILE"; then
     mv "$backup" "$STATE_DIR/pending-previous"
@@ -252,6 +280,11 @@ case "${1:-status}" in
     echo "当前识别网卡: $(phys_ifaces)"
     echo '实际 PF 状态与内核规则（文件存在不代表生效）:'
     pfctl -si; pfctl -a "$ANCHOR" -vvsr
+    if [ -s "$CIDR_FILE" ]; then
+      count=$(awk 'NF {n++} END {print n+0}' "$CIDR_FILE")
+      echo "当前名单条目：$count / 256"
+      if [ "$count" -ge 200 ]; then echo '提醒：名单接近上限，请查看日志并检查旧地址。'; fi
+    fi
     if [ -f "$STATE_DIR/last-dns-success" ]; then
       echo "最近 DNS 查询（UTC，完整性请看日志）: $(cat "$STATE_DIR/last-dns-success")"
     else echo '尚无成功 DNS 检查记录；请查看服务日志。'; fi
@@ -292,7 +325,7 @@ case "${1:-status}" in
     remove_rules
     rm -f "$DAEMON_PLIST"
     if [ "$1" = uninstall ]; then
-      rm -f "$INSTALL_PATH" "$CIDR_FILE" "$SERVER_FILE" "$PROXY_PORT_FILE" "$STATE_DIR/last-dns-success" "$STATE_DIR/pending-previous" "$HELPER"
+      rm -f "$INSTALL_PATH" "$CIDR_FILE" "$SERVER_FILE" "$PROXY_PORT_FILE" "$STATE_DIR/last-dns-success" "$STATE_DIR/pending-previous" "$HISTORY_FILE" "$HELPER"
       rmdir /usr/local/libexec/claude-lockdown 2>/dev/null || true
       echo '已先撤销规则，再删除开机任务、安装脚本及网段缓存。'
     else echo '已撤销规则并移除自动启用任务；需要自动启用时重新 install。'; fi
@@ -303,9 +336,9 @@ case "${1:-status}" in
     ;;
   reconcile)
     need_root; lock; trap unlock EXIT
-    # Keep cached rules active even if SFM/DNS is unavailable at boot.
+    # Leave matching rules untouched; repair missing or changed rules first.
     ensure_cidrs
-    apply_rules
+    if ! current_rules_match; then apply_rules; fi
     if [ -s "$SERVER_FILE" ] && [ -r "$HELPER" ]; then
       refresh_known || echo '本次未更新 DNS；既有规则仍保留。' >&2
     fi
@@ -354,7 +387,7 @@ PYVALIDATE
 <plist version="1.0"><dict>
 <key>Label</key><string>$DAEMON_LABEL</string>
 <key>ProgramArguments</key><array><string>/bin/bash</string><string>$INSTALL_PATH</string><string>reconcile</string></array>
-<key>RunAtLoad</key><true/><key>StartInterval</key><integer>86400</integer>
+<key>RunAtLoad</key><true/><key>StartInterval</key><integer>3600</integer>
 <key>StandardOutPath</key><string>/var/log/claude-lockdown.log</string>
 <key>StandardErrorPath</key><string>/var/log/claude-lockdown.log</string>
 </dict></plist>
@@ -363,7 +396,7 @@ PLIST
     plutil -lint "$DAEMON_PLIST"
     unlock
     launchctl bootstrap system "$DAEMON_PLIST"
-    echo '已注册开机及每 24 小时更新。请用 status 和服务日志检查结果。'
+    echo '已注册开机及每小时更新。请用 status 和服务日志检查结果。'
     ;;
   *) echo '用法: sudo bash claude-lockdown.sh {status|on [--keep]|off|refresh|install --sfm-profile 路径 --proxy-port 端口|uninstall}'; exit 2;;
 esac

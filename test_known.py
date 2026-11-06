@@ -55,4 +55,42 @@ class TestStoredServerIps(unittest.TestCase):
         for data in ({'servers':[]},{'servers':['host.example']}):
             with self.assertRaises(ValueError): k.read_server_snapshot(data)
 
+
+class TestRetention(unittest.TestCase):
+    def setUp(self):
+        self.old='160.79.104.0/21\n34.120.108.227/32\n'
+        self.now=2_000_000_000
+        self.history={'version':1,'last_seen':{'34.120.108.227':self.now-31*86400},'missing_since':{'34.120.108.227':self.now-31*86400},'last_complete_at':self.now-3600}
+    def test_old_dynamic_address_expires_after_30_days(self):
+        def resolve(name,kind):return ['35.190.46.17'] if kind=='A' else []
+        out,_,hist=k.merge_with_history(self.old,['claude.ai'],resolve,self.history,self.now)
+        self.assertNotIn('34.120.108.227/32',out.splitlines())
+        self.assertIn('160.79.104.0/21',out.splitlines())
+        self.assertIn('35.190.46.17/32',out.splitlines())
+        self.assertNotIn('34.120.108.227',hist['last_seen'])
+    def test_partial_lookup_failure_never_removes_old(self):
+        def resolve(name,kind):
+            if kind=='AAAA':raise OSError('proxy down')
+            return ['35.190.46.17']
+        out,errors,_=k.merge_with_history(self.old,['claude.ai'],resolve,self.history,self.now)
+        self.assertIn('34.120.108.227/32',out.splitlines());self.assertTrue(errors)
+    def test_untracked_existing_address_gets_full_grace(self):
+        out,_,hist=k.merge_with_history(self.old,['claude.ai'],lambda n,f:['35.190.46.17'] if f=='A' else [],{},self.now)
+        self.assertIn('34.120.108.227/32',out.splitlines());self.assertEqual(hist['last_seen']['34.120.108.227'],self.now)
+    def test_seen_old_address_is_refreshed(self):
+        out,_,hist=k.merge_with_history(self.old,['claude.ai'],lambda n,f:['34.120.108.227'] if f=='A' else [],self.history,self.now)
+        self.assertIn('34.120.108.227/32',out.splitlines());self.assertEqual(hist['last_seen']['34.120.108.227'],self.now)
+    def test_long_offline_gap_restarts_retention_clock(self):
+        self.history['last_complete_at']=self.now-3*86400
+        out,_,hist=k.merge_with_history(self.old,['claude.ai'],lambda n,f:['35.190.46.17'] if f=='A' else [],self.history,self.now)
+        self.assertIn('34.120.108.227/32',out.splitlines())
+        self.assertEqual(hist['missing_since']['34.120.108.227'],self.now)
+    def test_fresh_history_never_immediately_expires(self):
+        historical={'version':1,'last_seen':{'34.120.108.227':self.now-31*86400}}
+        out,_,_=k.merge_with_history(self.old,['claude.ai'],lambda n,f:['35.190.46.17'] if f=='A' else [],historical,self.now)
+        self.assertIn('34.120.108.227/32',out.splitlines())
+    def test_corrupted_history_does_not_delete(self):
+        with self.assertRaises(ValueError):
+            k.merge_with_history(self.old,['claude.ai'],lambda n,f:['35.190.46.17'] if f=='A' else [],{'version':1,'last_seen':{'34.120.108.227':'bad'}},self.now)
+
 if __name__=='__main__': unittest.main()

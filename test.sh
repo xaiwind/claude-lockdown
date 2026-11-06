@@ -116,6 +116,7 @@ echo 'PASS: stale kernel rules rejected'
 # A failed DNS update or failed rule load cannot discard the existing block list.
 (
   STATE_DIR="$TMP/refresh-state"; mkdir -p "$STATE_DIR"
+  HISTORY_FILE="$STATE_DIR/known-ip-history.json"
   pfctl() { return 0; }
   CIDR_FILE="$STATE_DIR/cidrs"
   printf '160.79.104.0/21\n' > "$CIDR_FILE"
@@ -123,11 +124,11 @@ echo 'PASS: stale kernel rules rejected'
   apply_rules() { return 0; }
   if refresh_known; then echo 'FAIL: DNS failure reported success' >&2; exit 1; fi
   [ "$(cat "$CIDR_FILE")" = '160.79.104.0/21' ]
-  collect_known() { printf '160.79.104.0/21\n34.120.108.227/32\n' > "$1"; }
+  collect_known() { printf '160.79.104.0/21\n34.120.108.227/32\n' > "$1"; printf '{"version":1,"last_seen":{}}' > "$2"; }
   apply_rules() { return 1; }
   if refresh_known; then echo 'FAIL: PF failure reported success' >&2; exit 1; fi
   [ "$(cat "$CIDR_FILE")" = '160.79.104.0/21' ]
-  collect_known() { printf '160.79.104.0/21\n34.120.108.227/32\n' > "$1"; }
+  collect_known() { printf '160.79.104.0/21\n34.120.108.227/32\n' > "$1"; printf '{"version":1,"last_seen":{}}' > "$2"; }
   apply_rules() { return 0; }
   refresh_known
   grep -q '^34.120.108.227/32$' "$CIDR_FILE"
@@ -161,8 +162,9 @@ echo 'PASS: baseline persists and existing list is never replaced'
 # A failed connection-state cleanup stays visible and is retried next time.
 (
   STATE_DIR="$TMP/pending-state"; mkdir -p "$STATE_DIR"; CIDR_FILE="$STATE_DIR/cidrs"
+  HISTORY_FILE="$STATE_DIR/known-ip-history.json"
   printf '160.79.104.0/21\n' > "$CIDR_FILE"
-  collect_known() { printf '160.79.104.0/21\n34.120.108.227/32\n' > "$1"; }
+  collect_known() { printf '160.79.104.0/21\n34.120.108.227/32\n' > "$1"; printf '{"version":1,"last_seen":{}}' > "$2"; }
   apply_rules() { return 0; }
   attempts=0
   kill_added_states() { attempts=$((attempts+1)); [ "$attempts" -gt 1 ]; }
@@ -173,3 +175,21 @@ echo 'PASS: baseline persists and existing list is never replaced'
   [ "$attempts" = 2 ]
 )
 echo 'PASS: failed state cleanup is retained and retried'
+# Expired dynamic IPs are removed only after successful rule verification;
+# metadata is not committed if applying rules fails.
+(
+  STATE_DIR="$TMP/expiration-state"; mkdir -p "$STATE_DIR"
+  CIDR_FILE="$STATE_DIR/cidrs"; HISTORY_FILE="$STATE_DIR/known-ip-history.json"
+  printf '160.79.104.0/21\n34.120.108.227/32\n' > "$CIDR_FILE"
+  printf '{"version":1,"last_seen":{"34.120.108.227":100}}' > "$HISTORY_FILE"
+  collect_known() { printf '160.79.104.0/21\n' > "$1"; printf '{"version":1,"last_seen":{}}' > "$2"; }
+  apply_rules() { return 1; }
+  if refresh_known; then echo 'FAIL: expiration commit succeeded on PF failure' >&2; exit 1; fi
+  grep -q '^34.120.108.227/32$' "$CIDR_FILE"
+  grep -q '34.120.108.227' "$HISTORY_FILE"
+  apply_rules() { return 0; }
+  refresh_known
+  if grep -q '34.120.108.227' "$CIDR_FILE" "$HISTORY_FILE"; then echo 'FAIL: expired IP retained' >&2; exit 1; fi
+  grep -q '^160.79.104.0/21$' "$CIDR_FILE"
+)
+echo 'PASS: expired addresses and metadata change only after rules verify'
