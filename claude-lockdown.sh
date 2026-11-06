@@ -261,6 +261,19 @@ refresh_known() {
   echo '已合并新 IP、验证内核规则并清理对应旧连接。'
 }
 
+resolve_install_args() {
+  if [ "$#" -eq 0 ]; then
+    echo '请输入当前 SFM 配置文件的绝对路径（可先运行 python3 find_sfm_profiles.py）：' >&2
+    IFS= read -r PROFILE || { fail '未输入 SFM 配置路径'; return 1; }
+    echo '请输入本地 HTTP/mixed 代理端口：' >&2
+    IFS= read -r PORT || { fail '未输入本地代理端口'; return 1; }
+  elif [ "$#" -eq 4 ] && [ "$1" = --sfm-profile ] && [ "$3" = --proxy-port ]; then
+    PROFILE="$2"; PORT="$4"
+  else
+    fail '用法: install [--sfm-profile 配置文件路径 --proxy-port 端口]'; return 1
+  fi
+}
+
 trial_cleanup() {
   lock || return 1
   if [ -f "$GENERATION_FILE" ] && [ "$(cat "$GENERATION_FILE")" = "$TRIAL_ID" ]; then
@@ -332,6 +345,9 @@ case "${1:-status}" in
     ;;
   refresh)
     need_root; lock; trap unlock EXIT
+    if ! current_rules_match; then
+      fail '阻断规则未完整启用；请先安装或开启后再刷新'; exit 1
+    fi
     refresh_known
     ;;
   reconcile)
@@ -346,14 +362,15 @@ case "${1:-status}" in
   install)
     need_root
     # Require explicit profile: do not guess a server and risk blocking the VPN.
-    [ "$#" -eq 5 ] && [ "$2" = --sfm-profile ] && [ "$4" = --proxy-port ] || {
-      fail '用法: install --sfm-profile 配置文件路径 --proxy-port 本地代理端口'; exit 1;
-    }
-    PROFILE="$3"; PORT="$5"
+    shift
+    resolve_install_args "$@"
     [[ "$PORT" =~ ^[0-9]+$ ]] && [ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ] || { fail '代理端口无效'; exit 1; }
     [[ "$PROFILE" = /* ]] && [ -f "$PROFILE" ] || { fail 'SFM 配置路径必须是存在的绝对路径'; exit 1; }
     SOURCE_HELPER="$(dirname "$SELF")/known_addresses.py"
-    [ -r "$SOURCE_HELPER" ] || { fail '找不到同目录的 known_addresses.py'; exit 1; }
+    if [ ! -r "$SOURCE_HELPER" ] && [ "$SELF" = "$INSTALL_PATH" ] && [ -r "$HELPER" ]; then
+      SOURCE_HELPER="$HELPER"
+    fi
+    [ -r "$SOURCE_HELPER" ] || { fail '找不到 known_addresses.py；请在项目目录运行安装'; exit 1; }
     SERVERS_JSON=$(python3 - "$SOURCE_HELPER" "$PROFILE" "$PORT" "$CIDR_FILE" "$DEFAULT_CIDRS" <<'PYVALIDATE'
 import importlib.util, json, pathlib, sys
 s=importlib.util.spec_from_file_location('known_addresses',sys.argv[1]); m=importlib.util.module_from_spec(s); s.loader.exec_module(m)
@@ -373,7 +390,7 @@ PYVALIDATE
     stop_daemon
     lock; trap unlock EXIT
     mkdir -p /usr/local/libexec/claude-lockdown
-    cp "$SOURCE_HELPER" "$HELPER"
+    if [ "$SOURCE_HELPER" != "$HELPER" ]; then cp "$SOURCE_HELPER" "$HELPER"; fi
     chmod 644 "$HELPER"; chown root:wheel "$HELPER"
     printf '%s\n' "$SERVERS_JSON" > "$SERVER_FILE"
     printf '%s\n' "$PORT" > "$PROXY_PORT_FILE"
@@ -398,5 +415,5 @@ PLIST
     launchctl bootstrap system "$DAEMON_PLIST"
     echo '已注册开机及每小时更新。请用 status 和服务日志检查结果。'
     ;;
-  *) echo '用法: sudo bash claude-lockdown.sh {status|on [--keep]|off|refresh|install --sfm-profile 路径 --proxy-port 端口|uninstall}'; exit 2;;
+  *) echo '用法: sudo bash claude-lockdown.sh {status|on [--keep]|off|refresh|install [--sfm-profile 路径 --proxy-port 端口]|uninstall}'; exit 2;;
 esac

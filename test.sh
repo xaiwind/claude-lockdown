@@ -193,3 +193,25 @@ echo 'PASS: failed state cleanup is retained and retried'
   grep -q '^160.79.104.0/21$' "$CIDR_FILE"
 )
 echo 'PASS: expired addresses and metadata change only after rules verify'
+# The legacy no-argument install command must prompt safely and preserve paths with spaces.
+(
+  resolve_install_args < <(printf '/Users/example/Group Containers/config.json\n2345\n')
+  [ "$PROFILE" = '/Users/example/Group Containers/config.json' ]
+  [ "$PORT" = '2345' ]
+  resolve_install_args --sfm-profile '/tmp/a config.json' --proxy-port 4321
+  [ "$PROFILE" = '/tmp/a config.json' ] && [ "$PORT" = 4321 ]
+  if resolve_install_args --bad </dev/null; then echo 'FAIL: invalid install arguments accepted' >&2; exit 1; fi
+  if resolve_install_args </dev/null; then echo 'FAIL: missing interactive input accepted' >&2; exit 1; fi
+)
+echo 'PASS: legacy interactive and explicit install arguments'
+# Refresh must not silently re-enable protection after off.
+(
+  need_root() { :; }; lock() { :; }; unlock() { :; }
+  current_rules_match() { return 1; }
+  refresh_known() { touch "$TMP/refresh_was_called"; }
+  if (set -- refresh; source <(sed -n '/^case "${1:-status}"/,$p' claude-lockdown.sh)); then
+    echo 'FAIL: refresh accepted inactive rules' >&2; exit 1
+  fi
+  [ ! -e "$TMP/refresh_was_called" ]
+)
+echo 'PASS: refresh does not reactivate stopped rules'

@@ -61,6 +61,8 @@ sudo tail -n 80 /var/log/claude-lockdown.log
 
 ## 日常命令
 
+完整的旧版命令对照和新版用法见 [命令清单](COMMANDS.md)。
+
 在项目目录中运行：
 
 ```bash
@@ -83,7 +85,7 @@ sudo bash claude-lockdown.sh uninstall  # 卸载本工具
 ```bash
 bash -n claude-lockdown.sh
 bash test.sh
-python3 -m unittest test_find_sfm.py test_known.py test_integration.py test_pf_dryrun.py
+python3 -m unittest test_find_sfm.py test_known.py test_integration.py test_commands.py test_pf_dryrun.py
 ```
 
 测试包含模拟 PF 和 macOS PF 解析器检查。曾用非 Claude 测试地址验证同类 IPv4 规则的断线行为；没有逐个测试真实 Claude 地址，也不能据此保证全部地址受保护。
