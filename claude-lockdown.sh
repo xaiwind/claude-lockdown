@@ -233,7 +233,7 @@ case "${1:-status}" in
 <plist version="1.0"><dict>
 <key>Label</key><string>$DAEMON_LABEL</string>
 <key>ProgramArguments</key><array><string>/bin/bash</string><string>$INSTALL_PATH</string><string>reconcile</string></array>
-<key>RunAtLoad</key><true/><key>StartInterval</key><integer>15</integer>
+<key>RunAtLoad</key><true/><key>StartInterval</key><integer>86400</integer>
 <key>StandardOutPath</key><string>/var/log/claude-lockdown.log</string>
 <key>StandardErrorPath</key><string>/var/log/claude-lockdown.log</string>
 </dict></plist>
@@ -243,7 +243,7 @@ PLIST
     stop_daemon
     unlock
     launchctl bootstrap system "$DAEMON_PLIST"
-    echo '已注册开机及每 15 秒规则刷新。开机/新网卡存在未覆盖窗口，不是无缝 kill switch。'
+    echo '已注册开机及每 86400 秒（24 小时）规则刷新。开机/新网卡存在未覆盖窗口，不是无缝 kill switch。'
     ;;
   *) echo '用法: sudo bash claude-lockdown.sh {status|on [--keep]|off|refresh|install|uninstall}'; exit 2;;
 esac

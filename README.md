@@ -11,7 +11,7 @@ sudo bash claude-lockdown.sh status
 sudo bash claude-lockdown.sh on          # 前台试用 60 秒；Ctrl-C 撤销
 sudo bash claude-lockdown.sh on --keep   # 保持至 off 或重启
 sudo bash claude-lockdown.sh refresh     # Python 3；ARIN 更新网段缓存
-sudo bash claude-lockdown.sh install     # 安装启动任务，每 15 秒刷新规则
+sudo bash claude-lockdown.sh install     # 安装启动任务，每 24 小时刷新规则
 sudo bash claude-lockdown.sh off         # 撤销规则，同时取消自动启用任务
 sudo bash claude-lockdown.sh uninstall   # 先撤销规则，再移除安装文件
 ```
@@ -58,7 +58,7 @@ bash test.sh
 
 实际验收不使用真实 Claude 账号，也不通过关闭 VPN 后发送 Claude 请求来试错。先退出已登录的 Claude 客户端、CLI 和相关浏览器页面，在独立测试环境中用自有测试服务器及临时测试网段验证 VPN 开启/关闭、IPv4/IPv6、已有连接、网卡切换和重启。结合抓包、测试服务器日志和 PF 计数交叉确认。测试通过只能证明该场景中的规则机制，不能证明 Anthropic 网段名单完整。
 
-新插入网卡、开机到任务启动之间，以及外部程序刷新 PF 后，都可能有覆盖窗口。15 秒刷新不是实时保证。未在名单内的 CDN/IP、其他代理或网络扩展、非匹配接口不在保证范围内。需要严格“隧道一停所有指定应用立即断网”时，应另行设计应用级或更完整的网络策略，不能把本脚本当作替代品。
+新插入网卡、开机到任务启动之间，以及外部程序刷新 PF 后，都可能有覆盖窗口。24 小时刷新不是实时保证，期间新网卡或被外部重载的规则可能长时间不受保护。未在名单内的 CDN/IP、其他代理或网络扩展、非匹配接口不在保证范围内。需要严格“隧道一停所有指定应用立即断网”时，应另行设计应用级或更完整的网络策略，不能把本脚本当作替代品。
 
 ## 选择哪种方案
 
