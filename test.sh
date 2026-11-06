@@ -32,7 +32,7 @@ pfctl() {
     '-E') echo 'Token : 12345';;
     '-X 12345') return 0;;
     '-n '*) [ "$MODE" != syntax_fail ];;
-    "-a $ANCHOR -sr") cat "$KERNEL";;
+    "-a $ANCHOR -sr"|"-a $ANCHOR -vvsr") cat "$KERNEL";;
     "-a $ANCHOR -F rules") : > "$KERNEL";;
     "-a $ANCHOR -f "*)
       if [ "$MODE" = load_fail ] && [[ "$4" == *rules.* ]]; then return 1; fi
@@ -66,8 +66,13 @@ echo old > "$GENERATION_FILE"
 trial_cleanup
 [ ! -s "$KERNEL" ]; [ ! -f "$TOKEN_FILE" ]; [ ! -f "$GENERATION_FILE" ]
 grep -q 'current unrelated rules' "$PF_CONF"
-# Probes must not label a DNS failure a verified block.
-curl() { printf 000; return 6; }
-probe > "$TMP/probe"
-grep -q 'curl_exit=6' "$TMP/probe"
-echo 'PASS: dual-stack multi-interface rules, load/syntax failure rollback, injection rejection, generation cancellation, token release, honest probe'
+echo 'PASS: dual-stack multi-interface rules, rollback, injection rejection, generation cancellation, token release'
+# Execute the real status branch under mocks: no request to any target is permitted.
+(
+  need_root() { :; }
+  curl() { echo 'Unexpected network request' >&2; exit 97; }
+  set -- status
+  source <(sed -n '/^case "${1:-status}"/,$p' claude-lockdown.sh)
+) > "$TMP/status"
+grep -q '未向 Claude/Anthropic' "$TMP/status"
+echo 'PASS: status is passive and sends no Claude requests'

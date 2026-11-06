@@ -115,12 +115,6 @@ kill_target_states() {
     case "$c" in *:*) pfctl -k ::/0 -k "$c";; *) pfctl -k 0.0.0.0/0 -k "$c";; esac
   done
 }
-probe() {
-  local code rc=0
-  # Ignore ~/.curlrc and proxy environment; this still follows OS routing, not proof of a tunnel.
-  code=$(curl -q --proxy '' --noproxy '*' --connect-timeout 5 --max-time 10 -sS -o /dev/null -w '%{http_code}' "$@" https://claude.ai) || rc=$?
-  printf 'curl_exit=%s http=%s（失败不等于已证明 PF 阻断）\n' "$rc" "$code"
-}
 refresh_cidrs() {
   command -v python3 >/dev/null || { fail 'refresh 需要 Python 3'; return 1; }
   python3 - "$CIDR_FILE" <<'PY'
@@ -160,9 +154,7 @@ case "${1:-status}" in
     echo "当前识别网卡: $(phys_ifaces)"
     echo '实际 PF 状态与内核规则（文件存在不代表生效）:'
     pfctl -si; pfctl -a "$ANCHOR" -vvsr
-    echo '普通路由访问测试（不保证经过隧道）:'; probe
-    echo '网卡绑定测试（只作诊断，不证明实际路径或阻断原因）:'
-    for i in $(phys_ifaces); do echo "$i"; probe --interface "$i"; done
+    echo '只读检查完成；未向 Claude/Anthropic 发送任何请求。'
     ;;
   on)
     need_root
@@ -178,7 +170,7 @@ case "${1:-status}" in
     uuidgen > "$GENERATION_FILE"
     TRIAL_ID=$(cat "$GENERATION_FILE")
     unlock
-    echo '指定网段规则已加载；不代表全部 Claude 域名受保护。目标网段的既有连接已重置。'
+    echo '指定网段规则已加载；不代表全部 Claude 域名受保护。接下来清理目标连接状态。'
     if [ "${2:-}" = --keep ]; then
       kill_target_states
       echo '保持至 off 或重启；开机及网卡变更刷新需使用 install。'
