@@ -10,8 +10,8 @@ class Integration(unittest.TestCase):
             (state/'cidrs').write_text(old);(state/'boot').write_text('boot123\n');(state/'pf-token').write_text('12345\n')
             old_rules='block drop out quick on en0 inet from any to 160.79.104.0/21\n'
             (state/'rules').write_text(old_rules);(root/'kernel').write_text(old_rules)
-            (state/'sfm-profile').write_text('/not-used.json\n');(state/'proxy-port').write_text('2345\n')
-            helper=root/'known.py';helper.write_text("import pathlib,sys\np=pathlib.Path(sys.argv[sys.argv.index('--output')+1]);p.write_text("+repr(new)+")\n")
+            (state/'sfm-server-ips.json').write_text('{\"servers\":[\"8.8.8.8\"]}\n');(state/'proxy-port').write_text('2345\n')
+            helper=root/'known.py';helper.write_text("import pathlib,sys\nassert '--server-list' in sys.argv and '--sfm-profile' not in sys.argv\np=pathlib.Path(sys.argv[sys.argv.index('--output')+1]);p.write_text("+repr(new)+")\n")
             def executable(name,content):
                 p=binpath/name;p.write_text(content);p.chmod(0o755)
             executable('ifconfig','#!/bin/sh\necho en0\n')

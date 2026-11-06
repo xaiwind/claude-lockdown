@@ -14,7 +14,7 @@ TOKEN_FILE="$STATE_DIR/pf-token"
 GENERATION_FILE="$STATE_DIR/generation"
 INSTALL_PATH="/usr/local/sbin/claude-lockdown.sh"
 HELPER="/usr/local/libexec/claude-lockdown/known_addresses.py"
-PROFILE_FILE="$STATE_DIR/sfm-profile"
+SERVER_FILE="$STATE_DIR/sfm-server-ips.json"
 PROXY_PORT_FILE="$STATE_DIR/proxy-port"
 DAEMON_LABEL="com.claude.lockdown"
 DAEMON_PLIST="/Library/LaunchDaemons/$DAEMON_LABEL.plist"
@@ -189,12 +189,12 @@ PYADDED
 }
 
 collect_known() {
-  [ -r "$HELPER" ] && [ -s "$PROFILE_FILE" ] && [ -s "$PROXY_PORT_FILE" ] || {
+  [ -r "$HELPER" ] && [ -s "$SERVER_FILE" ] && [ -s "$PROXY_PORT_FILE" ] || {
     fail '未配置 SFM 文件或 DNS 更新组件；旧规则保持不变'; return 1;
   }
-  local profile port
-  profile=$(cat "$PROFILE_FILE"); port=$(cat "$PROXY_PORT_FILE")
-  python3 "$HELPER" --current "$CIDR_FILE" --output "$1" --sfm-profile "$profile" --proxy-port "$port"
+  local port
+  port=$(cat "$PROXY_PORT_FILE")
+  python3 "$HELPER" --current "$CIDR_FILE" --output "$1" --server-list "$SERVER_FILE" --proxy-port "$port"
 }
 
 refresh_known() {
@@ -292,7 +292,7 @@ case "${1:-status}" in
     remove_rules
     rm -f "$DAEMON_PLIST"
     if [ "$1" = uninstall ]; then
-      rm -f "$INSTALL_PATH" "$CIDR_FILE" "$PROFILE_FILE" "$PROXY_PORT_FILE" "$STATE_DIR/last-dns-success" "$STATE_DIR/pending-previous" "$HELPER"
+      rm -f "$INSTALL_PATH" "$CIDR_FILE" "$SERVER_FILE" "$PROXY_PORT_FILE" "$STATE_DIR/last-dns-success" "$STATE_DIR/pending-previous" "$HELPER"
       rmdir /usr/local/libexec/claude-lockdown 2>/dev/null || true
       echo '已先撤销规则，再删除开机任务、安装脚本及网段缓存。'
     else echo '已撤销规则并移除自动启用任务；需要自动启用时重新 install。'; fi
@@ -306,7 +306,7 @@ case "${1:-status}" in
     # Keep cached rules active even if SFM/DNS is unavailable at boot.
     ensure_cidrs
     apply_rules
-    if [ -s "$PROFILE_FILE" ] && [ -r "$HELPER" ]; then
+    if [ -s "$SERVER_FILE" ] && [ -r "$HELPER" ]; then
       refresh_known || echo '本次未更新 DNS；既有规则仍保留。' >&2
     fi
     ;;
@@ -321,7 +321,7 @@ case "${1:-status}" in
     [[ "$PROFILE" = /* ]] && [ -f "$PROFILE" ] || { fail 'SFM 配置路径必须是存在的绝对路径'; exit 1; }
     SOURCE_HELPER="$(dirname "$SELF")/known_addresses.py"
     [ -r "$SOURCE_HELPER" ] || { fail '找不到同目录的 known_addresses.py'; exit 1; }
-    python3 - "$SOURCE_HELPER" "$PROFILE" "$PORT" "$CIDR_FILE" "$DEFAULT_CIDRS" <<'PYVALIDATE'
+    SERVERS_JSON=$(python3 - "$SOURCE_HELPER" "$PROFILE" "$PORT" "$CIDR_FILE" "$DEFAULT_CIDRS" <<'PYVALIDATE'
 import importlib.util, json, pathlib, sys
 s=importlib.util.spec_from_file_location('known_addresses',sys.argv[1]); m=importlib.util.module_from_spec(s); s.loader.exec_module(m)
 with open(sys.argv[2]) as f: profile=json.load(f)
@@ -332,7 +332,9 @@ if any(ip.version == net.version and ip in net for ip in servers for net in old)
     raise SystemExit('现有阻断网段包含 SFM 服务器 IP，停止安装以免中断代理。')
 if not any(i.get('type') in ('mixed','http') and i.get('listen') == '127.0.0.1' and i.get('listen_port') == int(sys.argv[3]) for i in profile.get('inbounds',[])):
     raise SystemExit('SFM 配置未找到指定的本地 HTTP/mixed 端口')
+print(json.dumps(m.server_snapshot(profile)))
 PYVALIDATE
+    )
     bash "$SELF" on --keep
     # Stop the prior periodic job before acquiring the update lock.
     stop_daemon
@@ -340,7 +342,7 @@ PYVALIDATE
     mkdir -p /usr/local/libexec/claude-lockdown
     cp "$SOURCE_HELPER" "$HELPER"
     chmod 644 "$HELPER"; chown root:wheel "$HELPER"
-    printf '%s\n' "$PROFILE" > "$PROFILE_FILE"
+    printf '%s\n' "$SERVERS_JSON" > "$SERVER_FILE"
     printf '%s\n' "$PORT" > "$PROXY_PORT_FILE"
     mkdir -p /usr/local/sbin
     if [ "$SELF" != "$INSTALL_PATH" ]; then cp "$SELF" "$INSTALL_PATH"; fi

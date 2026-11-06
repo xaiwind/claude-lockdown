@@ -44,4 +44,15 @@ class TestProxyServerSafety(unittest.TestCase):
         ips=k.proxy_servers({'outbounds':[{'type':'vless','server':'8.8.8.8'},{'type':'direct'}]})
         self.assertEqual(ips,{ipaddress.ip_address('8.8.8.8')})
 
+
+class TestStoredServerIps(unittest.TestCase):
+    def test_minimal_snapshot_contains_no_credentials(self):
+        profile={'outbounds':[{'type':'vless','server':'8.8.8.8','uuid':'secret-value','tls':{'private_key':'sensitive'}},{'type':'direct'}]}
+        snapshot=k.server_snapshot(profile)
+        self.assertEqual(snapshot, {'servers':['8.8.8.8']})
+        self.assertNotIn('secret', str(snapshot))
+    def test_refuse_empty_or_domain_snapshot(self):
+        for data in ({'servers':[]},{'servers':['host.example']}):
+            with self.assertRaises(ValueError): k.read_server_snapshot(data)
+
 if __name__=='__main__': unittest.main()

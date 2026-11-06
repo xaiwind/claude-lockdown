@@ -47,6 +47,21 @@ def proxy_servers(profile):
     return servers
 
 
+
+def server_snapshot(profile):
+    # Persist only the IPs, never credentials or the SFM profile itself.
+    return {'servers': sorted(str(ip) for ip in proxy_servers(profile))}
+
+
+def read_server_snapshot(data):
+    values = data.get('servers')
+    if not isinstance(values, list) or not values:
+        raise ValueError('代理服务器 IP 快照为空；不更新名单。')
+    try:
+        return {ipaddress.ip_address(value) for value in values}
+    except ValueError:
+        raise ValueError('代理服务器 IP 快照无效；不更新名单。')
+
 def public_address(value):
     try:
         ip = ipaddress.ip_address(value)
@@ -131,10 +146,13 @@ def main():
     parser.add_argument('--current',required=True)
     parser.add_argument('--output',required=True)
     parser.add_argument('--proxy-port',type=int,default=2345)
-    parser.add_argument('--sfm-profile',required=True)
+    source=parser.add_mutually_exclusive_group(required=True)
+    source.add_argument('--sfm-profile')
+    source.add_argument('--server-list')
     args=parser.parse_args()
     with open(args.current) as f: original=f.read()
-    with open(args.sfm_profile) as f: protected=proxy_servers(json.load(f))
+    with open(args.sfm_profile or args.server_list) as f: source_data=json.load(f)
+    protected=proxy_servers(source_data) if args.sfm_profile else read_server_snapshot(source_data)
     result,errors=merge(original,HOSTS,proxy_resolver(args.proxy_port),protected)
     with open(args.output,'w') as f: f.write(result)
     print(f'已查询已知域名；原有网段保留。查询异常 {len(errors)} 项。',file=sys.stderr)
