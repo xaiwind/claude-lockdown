@@ -82,7 +82,7 @@ sudo bash claude-lockdown.sh uninstall  # 停止规则并移除本工具安装�
 ```bash
 bash -n claude-lockdown.sh
 bash test.sh
-python3 -m unittest test_known.py test_integration.py
+python3 -m unittest test_known.py test_integration.py test_pf_dryrun.py
 ```
 
 测试使用模拟 PF，不更改电脑防火墙。真实环境仍须单独验证。系统重启到任务启动前、新网卡出现、其他程序重载 PF，以及 DNS 更新间隔内，均可能出现保护空档。

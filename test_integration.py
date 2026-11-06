@@ -19,13 +19,17 @@ class Integration(unittest.TestCase):
             executable('pfctl', '''#!/usr/bin/python3
 import os,pathlib,sys
 args=sys.argv[1:]; k=pathlib.Path(os.environ['MOCK_KERNEL'])
+no_optimization=args[:2]==['-o','none']
+if no_optimization: args=args[2:]
 if args==['-sr']: print('anchor "com.apple/*" all')
 elif args==['-si']: print('Status: Enabled')
 elif args[:1] in (['-n'],['-k']): pass
 elif len(args)>=3 and args[0]=='-a' and args[2]=='-sr': print(k.read_text(),end='')
 elif len(args)>=4 and args[0]=='-a' and args[2]=='-f':
   proposed=pathlib.Path(args[3]).read_text()
-  if not (os.environ.get('MOCK_STALE')=='1' and '34.120.108.227' in proposed): k.write_text(proposed)
+  if not (os.environ.get('MOCK_STALE')=='1' and '34.120.108.227' in proposed):
+   if not no_optimization and '34.120.108.227' in proposed: k.write_text('block drop out quick on en0 inet from any to <__automatic_0>\\n')
+   else: k.write_text(proposed)
 elif len(args)>=4 and args[0]=='-a' and args[2]=='-F': k.write_text('')
 else: print('unexpected fake pfctl command',args,file=sys.stderr);sys.exit(1)
 ''')

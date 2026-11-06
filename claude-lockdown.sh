@@ -109,8 +109,8 @@ install_rules() {
     done
   done
   [ -s "$tmp" ] || { rm -f "$tmp"; fail '空规则'; return 1; }
-  if ! pfctl -n -a "$ANCHOR" -f "$tmp"; then rm -f "$tmp"; return 1; fi
-  if ! pfctl -a "$ANCHOR" -f "$tmp"; then rm -f "$tmp"; return 1; fi
+  if ! pfctl -o none -n -a "$ANCHOR" -f "$tmp"; then rm -f "$tmp"; return 1; fi
+  if ! pfctl -o none -a "$ANCHOR" -f "$tmp"; then rm -f "$tmp"; return 1; fi
   if [ ! -s "$TOKEN_FILE" ]; then
     local output token
     output=$(pfctl -E 2>&1) || { printf '%s\n' "$output" >&2; return 1; }
@@ -138,7 +138,7 @@ apply_rules() {
   else
     echo '加载失败，尝试恢复脚本自身的旧规则。' >&2
     if [ "$had_rules" = 1 ]; then
-      pfctl -a "$ANCHOR" -f "$previous" || { rm -f "$previous"; fail '回滚失败，必须人工检查 PF'; return 1; }
+      pfctl -o none -a "$ANCHOR" -f "$previous" || { rm -f "$previous"; fail '回滚失败，必须人工检查 PF'; return 1; }
       mv "$previous" "$ANCHOR_FILE"
     else
       rm -f "$previous"

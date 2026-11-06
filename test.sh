@@ -25,6 +25,7 @@ echo 'PASS: isolated removal and PF failure propagation'
 KERNEL="$TMP/kernel"; CALLS="$TMP/calls"; : > "$CALLS"
 MODE=ok
 pfctl() {
+  [ "${1:-}" != -o ] || shift 2
   printf '%s\n' "$*" >> "$CALLS"
   case "$*" in
     '-sr') echo 'anchor "com.apple/*" all';;
@@ -99,6 +100,7 @@ echo 'PASS: default scrub anchor and empty legacy migration entry accepted, acti
   printf 'block drop out quick on en0 inet from any to 160.79.104.0/21\n' > "$ANCHOR_FILE"
   phys_ifaces() { echo en0; }
   pfctl() {
+    [ "${1:-}" != -o ] || shift 2
     case "$*" in
       '-sr') echo 'anchor "com.apple/*" all';;
       '-si') echo 'Status: Enabled';;
